@@ -91,13 +91,13 @@ public static class Program
         private static IRecyclableBufferPool<byte> exactSizePool =
             RecyclableBufferPool<byte>.DirtyBuffersOfExactSize;
         private ITransferUtility transferUtility;
-        private static string outputPath;
-        private static long workingSetForProcess = 0;
-        private static long interationCount = 0;
-        private static long totalUploadTime = 0;
-        private static long totalCompressionTime = 0;
-        private static long totalFileSizeUncompressed = 0;
-        private static long totalFileSizeCompressed = 0;
+        private string outputPath;
+        private long workingSetForProcess = 0;
+        private long interationCount = 0;
+        private long totalUploadTime = 0;
+        private long totalCompressionTime = 0;
+        private long totalFileSizeUncompressed = 0;
+        private long totalFileSizeCompressed = 0;
         private Stream logsOutputFileStream;
         private Stream gcDumpOutputFileStream;
         private const int fileIOBufferSize = 64 * 1024;

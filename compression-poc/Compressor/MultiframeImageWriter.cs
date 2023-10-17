@@ -1,4 +1,5 @@
 ﻿using System.Net;
+using System.Runtime.InteropServices.ComTypes;
 using CharLS.Native;
 
 using Philips.Platform.Common;
@@ -29,8 +30,8 @@ public class MultiframeImageWriter : IDisposable
     private CommonDicomObject imageHeader;
     private DicomVR pixelDataVR = DicomVR.OB; //fixed for compressed data
     private readonly TransferSyntax destinationTransferSyntax;
-    private static IRecyclableBufferPool<byte> exactSizePool =
-        RecyclableBufferPool<byte>.DirtyBuffersOfExactSize;
+    //Using a static to avoid retrieving the buffer pool for each instance
+    private static IRecyclableBufferPool<byte> exactSizePool = RecyclableBufferPool<byte>.DirtyBuffersOfExactSize;
 
     private static DictionaryTag bytePixelDataTag = new(
         DicomDictionary.DicomPixelData.Tag,
@@ -108,12 +109,8 @@ public class MultiframeImageWriter : IDisposable
         Stream framePixelData = frameData;
         if (NeedsTransferSyntaxConversion(imageHeader, out string sourceTransferSyntax))
         {
-            using CommonDicomObject frameObject = imageHeader.ShallowCopy();
-            frameObject.SetBulkDataAndTransferOwnership(
-                pixelDataTagWithVROB,
-                framePixelData);
-            CompressPixelData(frameObject, sourceTransferSyntax);
-            framePixelData = frameObject.GetBulkData(pixelDataTagWithVROB);
+            using CommonDicomObject imageHeaderObject = imageHeader.ShallowCopy();
+            framePixelData = CompressPixelData(imageHeaderObject, frameData, sourceTransferSyntax);
         }
 
         SetItemDelimiter((int)framePixelData.Length);
@@ -153,7 +150,7 @@ public class MultiframeImageWriter : IDisposable
         //Apply transfer syntax conversion to update the header metadata
         if (NeedsTransferSyntaxConversion(storedDicomObject, out string sourceTransferSyntax))
         {
-            CompressPixelData(storedDicomObject, sourceTransferSyntax);
+            CompressPixelData(storedDicomObject, null, sourceTransferSyntax);
         }
         imageHeader.Remove(DicomDictionary.DicomPixelData);
 
@@ -224,8 +221,11 @@ public class MultiframeImageWriter : IDisposable
         outputDataStream.Write(BitConverter.GetBytes(0xFFFFFFFF), 0, 4);
     }
 
-    private void CompressPixelData(CommonDicomObject composite, string imageHeaderTsn)
+    private MemoryStream CompressPixelData(CommonDicomObject composite, Stream frameDataStream, string imageHeaderTsn)
     {
+        byte[] inputPixelDataBuffer = null;
+        byte[] outputPixelDataBuffer = null;
+        MemoryStream compressedPixelStream = null;
         try
         {
             DicomObject compositeObj = (DicomObject)composite;
@@ -254,39 +254,53 @@ public class MultiframeImageWriter : IDisposable
                 }
             }
 
-            if (compositeObj.HasTag(DicomDictionary.DicomPixelData))
+            if (frameDataStream != null)
             {
-                DictionaryTag newPixelDataTag = GetPixelDataTag(compositeObj);
-                if (compositeObj.HasValue(newPixelDataTag))
-                {
-                    byte[] uncompressedData = ReadPixelData(composite, newPixelDataTag, out bool shouldFree);
-                    byte[] compressedData = Compress(uncompressedData);
-                    if (shouldFree)
-                    {
-                        FreeReadPixelData(ref uncompressedData);
-                    }
-                    var pixelData =
-                        new RecyclableBufferMemoryStream(
-                            compressedData, 0, compressedData.Length, false, false, exactSizePool);
-                    compositeObj.SetBulkDataAndTransferOwnership(newPixelDataTag, pixelData);
-                }
+                var frameDataLengh = (int)frameDataStream.Length;
+
+                //the output pixel stream buffer where compressed data would be written
+                using var compressedOutputMemStream = new RecyclableBufferMemoryStream(frameDataLengh, exactSizePool);
+                outputPixelDataBuffer = compressedOutputMemStream.GetBuffer();
+
+                //the input pixel stream buffer.
+                using var uncompressedInputMemStream = new RecyclableBufferMemoryStream(frameDataLengh, exactSizePool);
+                inputPixelDataBuffer = uncompressedInputMemStream.GetBuffer();
+                frameDataStream.Read(inputPixelDataBuffer);
+                byte[] compressedData = Compress(inputPixelDataBuffer, outputPixelDataBuffer);
+
+                compressedPixelStream =
+                    new RecyclableBufferMemoryStream(
+                        compressedData, 0, compressedData.Length, false, false, exactSizePool);
             }
 
             // Set the changed transfer syntax after association
             compositeObj.SetString(
                 DicomDictionary.DicomTransferSyntaxUid, destinationTransferSyntax.ToString());
 
+            return compressedPixelStream;
+
         }
         catch (Exception exception)
         {
             throw new TransferSyntaxConversionException(exception.Message, exception);
         }
+        finally
+        {
+            if (inputPixelDataBuffer != null)
+            {
+                exactSizePool.Return(ref inputPixelDataBuffer);
+            }
+            if (outputPixelDataBuffer != null)
+            {
+                exactSizePool.Return(ref outputPixelDataBuffer);
+            }
+        }
     }
 
-    private byte[] Compress(byte[] uncompressedData)
+    private byte[] Compress(byte[] inputPixelData, byte[] outputBuffer)
     {
-        using var jpegEncoder = GetEncoder(uncompressedData);
-        jpegEncoder.Encode(uncompressedData);
+        using var jpegEncoder = GetEncoder(outputBuffer);
+        jpegEncoder.Encode(inputPixelData);
         return jpegEncoder.EncodedData.ToArray();
     }
 
@@ -301,10 +315,26 @@ public class MultiframeImageWriter : IDisposable
             out int planarConfig,
             out string photometricInterpretation);
         FrameInfo frameInfo = new(width, height, colorPixelDepth, components);
-        var encoder = new JpegLSEncoder(frameInfo);
+
+        /* //No error but reader unable to open the file
         //var encoder = new JpegLSEncoder();
-        //encoder.Destination = new byte[uncompressedData.Length];
         //encoder.FrameInfo = frameInfo;
+        //encoder.Destination = uncompressedData;
+        */
+
+        /* // No error but pixel data is not same
+        var encoder = new JpegLSEncoder(frameInfo, false);
+        encoder.Destination = uncompressedData;
+        encoder.InterleaveMode = GetInterleaveMode(components, photometricInterpretation, planarConfig);
+        */
+
+        /* //Method not allowed error
+        var encoder = new JpegLSEncoder(frameInfo);
+        encoder.Destination = uncompressedData;
+        */
+
+        var encoder = new JpegLSEncoder(frameInfo, false);
+        encoder.Destination = uncompressedData;
         encoder.InterleaveMode = GetInterleaveMode(components, photometricInterpretation, planarConfig);
         return encoder;
     }
@@ -353,57 +383,6 @@ public class MultiframeImageWriter : IDisposable
                 bytePixelDataTag : wordPixelDataTag;
         }
         return newPixelDataTag;
-    }
-
-    private static byte[] ReadPixelData(
-        CommonDicomObject composite, 
-        DictionaryTag newPixelDataTag, 
-        out bool shouldFree)
-    {
-        shouldFree = false;
-        byte[] pixelData = null;
-        if (composite is DicomObject aipObject)
-        {
-            var valueAsObject = aipObject.GetValue(newPixelDataTag);
-            using (var stream = GetPixelDataStream(valueAsObject, out shouldFree))
-            {
-                pixelData = ((MemoryStream)stream).GetBuffer();
-            }
-
-            composite.Remove(DicomDictionary.DicomPixelData);
-        }
-
-        return pixelData;
-    }
-
-    private static Stream GetPixelDataStream(object valueAsObject, out bool shouldFree)
-    {
-        Stream memoryStream = null;
-        shouldFree = false;
-        if (valueAsObject.GetType() == typeof(byte[]))
-        {
-            byte[] bulkData = (byte[])valueAsObject;
-            memoryStream = new MemoryStream(bulkData, 0, bulkData.Length, false, true);
-        }
-        else if (valueAsObject is Stream stream)
-        {
-            memoryStream = new RecyclableBufferMemoryStream((int)stream.Length);
-            long origin = stream.Position;
-            stream.CopyToUsingRecycledBuffer(memoryStream);
-            memoryStream.Seek(origin, SeekOrigin.Begin);
-            if (stream.CanSeek)
-            {
-                stream.Seek(origin, SeekOrigin.Begin);
-            }
-            shouldFree = true;
-        }
-
-        return memoryStream;
-    }
-
-    private static void FreeReadPixelData(ref byte[] buffer)
-    {
-        exactSizePool.Return(ref buffer);
     }
 
     #endregion
